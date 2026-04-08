@@ -1,0 +1,19 @@
+dino:
+  model_name: "facebook/dinov3-vitb16-pretrain-lvd1689m"
+  output_dim: 2048           # must match qwen hidden dim
+  use_lora: true
+  lora_rank: 8
+  lora_alpha: 16
+  lora_dropout: 0.1
+
+qwen:
+  model_name: "Qwen/Qwen3.5-2B"
+  use_lora: false            # enabled at stage 3
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_target_modules:
+    - "q_proj"
+    - "v_proj"
+
+max_regions: 32              # max <mask> tokens per sample

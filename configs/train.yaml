@@ -1,0 +1,41 @@
+output_dir: "./checkpoints"
+logging_dir: "./logs"
+
+# SpatialRGPT-format dataset paths
+data:
+  train_json: "data/annotations/osd_subset_100000.json"
+  val_json:   "data/annotations/osd_val.json"
+  image_root: "data/openimages/train"
+  depth_root: "data/relative_depth/raw"
+  max_length: 2048
+  max_regions: 32
+  subset_size: null         # null = use all entries from train_json
+
+# Training stages
+stages:
+  - name: "stage1_fusion_warmup"
+    epochs: 1
+    lr: 1.0e-4
+    trainable: ["fusion", "region_pooler", "dino_proj"]
+  - name: "stage2_dino_lora"
+    epochs: 2
+    lr: 5.0e-5
+    trainable: ["fusion", "region_pooler", "dino_proj", "dino_lora"]
+  - name: "stage3_joint"
+    epochs: 2
+    lr: 2.0e-5
+    trainable: ["fusion", "region_pooler", "dino_proj", "dino_lora", "qwen_lora"]
+
+# Optimisation
+per_device_train_batch_size: 2
+per_device_eval_batch_size: 4
+gradient_accumulation_steps: 8
+warmup_ratio: 0.03
+weight_decay: 0.01
+lr_scheduler: "cosine"
+fp16: false
+bf16: true
+dataloader_num_workers: 4
+save_steps: 500
+eval_steps: 500
+logging_steps: 50
