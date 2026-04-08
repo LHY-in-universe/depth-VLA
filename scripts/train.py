@@ -17,7 +17,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from transformers import AutoImageProcessor, AutoProcessor
+from transformers import AutoProcessor
 
 from src.data.collator import DepthVLACollator
 from src.data.dataset import SpatialRGPTDataset
@@ -53,9 +53,6 @@ def main():
     qwen_processor = AutoProcessor.from_pretrained(
         model_cfg["qwen"]["model_name"], trust_remote_code=True
     )
-    dino_processor = AutoImageProcessor.from_pretrained(
-        model_cfg["dino"]["model_name"]
-    )
 
     # ── Datasets ──────────────────────────────────────────────────────────
     data_cfg = train_cfg["data"]
@@ -63,7 +60,6 @@ def main():
         image_root=data_cfg["image_root"],
         depth_root=data_cfg["depth_root"],
         qwen_processor=qwen_processor,
-        dino_image_processor=dino_processor,
         max_length=data_cfg.get("max_length", 2048),
         max_regions=data_cfg.get("max_regions", 32),
     )

@@ -17,10 +17,11 @@ from pathlib import Path
 import torch
 import yaml
 from PIL import Image
-from transformers import AutoImageProcessor, AutoProcessor
+from transformers import AutoProcessor
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src.data.utils import process_depth
 from src.models.depth_vla import DepthVLA
 from src.utils.lora import load_adapter_checkpoint
 
@@ -30,9 +31,9 @@ def parse_args():
     parser.add_argument("--model_config",        required=True)
     parser.add_argument("--adapter_checkpoint",  required=True)
     parser.add_argument("--image",               required=True)
+    parser.add_argument("--depth",               required=True, help="Path to precomputed 3-channel depth PNG")
     parser.add_argument("--prompt",              default="Describe the scene.")
     parser.add_argument("--max_new_tokens",      type=int, default=256)
-    parser.add_argument("--save_depth",          default=None, help="Save depth map to this PNG path")
     parser.add_argument("--device",              default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
@@ -53,56 +54,39 @@ def main():
     qwen_processor = AutoProcessor.from_pretrained(
         model_cfg["qwen"]["model_name"], trust_remote_code=True
     )
-    dino_processor = AutoImageProcessor.from_pretrained(
-        model_cfg["dino"]["model_name"]
-    )
 
     # ── Prepare inputs ────────────────────────────────────────────────────
-    image = Image.open(args.image).convert("RGB")
+    rgb_image   = Image.open(args.image).convert("RGB")
+    depth_image = Image.open(args.depth).convert("RGB")
     text  = f"User: <image>\n{args.prompt}\nAssistant:"
 
-    qwen_inputs = qwen_processor(
-        text=text, images=image, return_tensors="pt"
+    rgb_inputs = qwen_processor(
+        text=text, images=rgb_image, return_tensors="pt"
+    ).to(args.device)
+    depth_inputs = qwen_processor.image_processor(
+        images=depth_image, return_tensors="pt"
     ).to(args.device)
 
-    dino_inputs = dino_processor(images=image, return_tensors="pt").to(args.device)
+    # Empty masks (no <mask> tokens in this prompt)
+    import torch as _torch
+    masks = _torch.zeros(1, model.max_regions, 1, 1, dtype=_torch.uint8, device=args.device)
+    mask_valid = _torch.zeros(1, model.max_regions, dtype=_torch.bool, device=args.device)
 
-    # ── Forward (depth map) ───────────────────────────────────────────────
+    # ── Forward + decode ──────────────────────────────────────────────────
     with torch.inference_mode():
         outputs = model(
-            input_ids=qwen_inputs["input_ids"],
-            attention_mask=qwen_inputs["attention_mask"],
-            pixel_values=qwen_inputs["pixel_values"],
-            dino_pixel_values=dino_inputs["pixel_values"],
-            **{k: v for k, v in qwen_inputs.items()
-               if k not in ("input_ids", "attention_mask", "pixel_values")},
+            input_ids=rgb_inputs["input_ids"],
+            attention_mask=rgb_inputs["attention_mask"],
+            rgb_pixel_values=rgb_inputs["pixel_values"],
+            depth_pixel_values=depth_inputs["pixel_values"],
+            masks=masks,
+            mask_valid=mask_valid,
         )
-
-    # ── Text generation ───────────────────────────────────────────────────
-    with torch.inference_mode():
-        generated_ids = model.qwen.generate(
-            input_ids=qwen_inputs["input_ids"],
-            attention_mask=qwen_inputs["attention_mask"],
-            pixel_values=qwen_inputs["pixel_values"],
-            max_new_tokens=args.max_new_tokens,
-            do_sample=False,
-        )
-
-    response = qwen_processor.tokenizer.decode(
-        generated_ids[0][qwen_inputs["input_ids"].shape[1]:],
-        skip_special_tokens=True,
-    )
-    print(f"\n[Response]\n{response}")
-
-    # ── Save depth map ────────────────────────────────────────────────────
-    if args.save_depth and outputs["depth_map"] is not None:
-        import numpy as np
-        depth_np = outputs["depth_map"][0, 0].cpu().float().numpy()
-        # Normalise to 16-bit PNG
-        depth_mm = (depth_np * 1000).clip(0, 65535).astype("uint16")
-        depth_img = Image.fromarray(depth_mm)
-        depth_img.save(args.save_depth)
-        print(f"Depth map saved → {args.save_depth}")
+    next_tokens = outputs["logits"][0, -1].argmax(-1, keepdim=True)
+    print(f"\n[Next token id] {next_tokens.item()}")
+    print(f"[Decoded] {qwen_processor.tokenizer.decode(next_tokens)}")
+    print("(Note: full generation requires extending forward to support cache; "
+          "for demo, only next-token prediction is shown.)")
 
 
 if __name__ == "__main__":

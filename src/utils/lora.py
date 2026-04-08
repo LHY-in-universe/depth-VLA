@@ -27,14 +27,14 @@ def get_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
 
 
 def get_non_lora_trainable_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
-    """Extract trainable non-LoRA weights (fusion, proj, depth_head)."""
+    """Extract trainable non-LoRA weights (fusion + region_pooler)."""
     return {
         k: v
         for k, v in model.state_dict().items()
         if "lora_" not in k
         and any(
             k.startswith(prefix)
-            for prefix in ("fusion.", "dino.proj.", "dino.norm.", "depth_head.")
+            for prefix in ("fusion.", "region_pooler.")
         )
     }
 

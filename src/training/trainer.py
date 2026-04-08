@@ -49,15 +49,9 @@ class StagedTrainer:
             print(f"  Stage {stage_idx}: {stage_cfg['name']}")
             print(f"{'='*60}")
 
-            # Enable Qwen LoRA at stage 3 if not already done
-            if stage_idx == 3 and not self._qwen_has_lora():
-                qwen_cfg = self.cfg.get("qwen_lora", {})
-                self.model.enable_qwen_lora(
-                    rank=qwen_cfg.get("rank", 16),
-                    alpha=qwen_cfg.get("alpha", 32),
-                    dropout=qwen_cfg.get("dropout", 0.05),
-                    target_modules=qwen_cfg.get("target_modules", ["q_proj", "v_proj"]),
-                )
+            # Enable Qwen LLM LoRA at stage 3 if not already done
+            if stage_idx == 3 and not self._llm_has_lora():
+                self.model.enable_llm_lora()
 
             self.model.set_trainable_stage(stage_idx)
             print_trainable_params(self.model, label=f"Stage {stage_idx}")
@@ -151,5 +145,8 @@ class StagedTrainer:
             for k, v in batch.items()
         }
 
-    def _qwen_has_lora(self) -> bool:
-        return any("lora_" in n for n, _ in self.model.qwen.named_parameters())
+    def _llm_has_lora(self) -> bool:
+        llm = self.model._find_llm_body()
+        if llm is None:
+            return False
+        return any("lora_" in n for n, _ in llm.named_parameters())

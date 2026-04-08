@@ -18,11 +18,11 @@ JSON schema (mirrors a8cheng/OpenSpatialDataset, file: result_10_depth_convs.jso
 Files on disk:
     {image_root}/{filename}.jpg            — original RGB
     {depth_root}/{filename}.png            — 3-channel pseudo-RGB depth (uint8)
+                                             precomputed by scripts/preprocess_depth.py
 """
 
 from __future__ import annotations
 
-import copy
 import json
 from pathlib import Path
 from typing import Any
@@ -30,12 +30,9 @@ from typing import Any
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
-from transformers import AutoImageProcessor, AutoProcessor
+from transformers import AutoProcessor
 
 from .utils import (
-    DEFAULT_DEPTH_TOKEN,
-    DEFAULT_IMAGE_TOKEN,
-    DEFAULT_MASK_TOKEN,
     preprocess_multimodal_text,
     process_depth,
     process_masks,
@@ -49,7 +46,6 @@ class SpatialRGPTDataset(Dataset):
         image_root: str,
         depth_root: str,
         qwen_processor: AutoProcessor,
-        dino_image_processor: AutoImageProcessor,
         max_length: int = 2048,
         max_regions: int = 32,
         subset_size: int | None = None,
@@ -57,11 +53,10 @@ class SpatialRGPTDataset(Dataset):
         self.image_root = Path(image_root)
         self.depth_root = Path(depth_root)
         self.qwen_processor = qwen_processor
-        self.dino_processor = dino_image_processor
         self.max_length = max_length
         self.max_regions = max_regions
 
-        print(f"Loading dataset JSON from {json_path} (this may take a while for large files)...")
+        print(f"Loading dataset JSON from {json_path}...")
         with open(json_path) as f:
             self.samples = json.load(f)
 
@@ -78,50 +73,58 @@ class SpatialRGPTDataset(Dataset):
 
         # ── Load RGB ──────────────────────────────────────────────────────
         image_path = self.image_root / f"{filename}.jpg"
-        image = Image.open(image_path).convert("RGB")
-        W, H = image.size
+        rgb_image = Image.open(image_path).convert("RGB")
+        W, H = rgb_image.size
 
-        # ── Load 3-channel depth (precomputed) ────────────────────────────
+        # ── Load 3-channel depth (precomputed offline by DINOv3 Depther) ──
         depth_image = process_depth(filename, self.depth_root)
 
         # ── Decode masks for <mask> tokens in conversation ────────────────
-        masks, mask_valid = process_masks(sample, image_h=H, image_w=W, max_regions=self.max_regions)
+        masks, mask_valid = process_masks(
+            sample, image_h=H, image_w=W, max_regions=self.max_regions
+        )
 
-        # ── Build prompt text ─────────────────────────────────────────────
-        text = preprocess_multimodal_text(sample["conversations"], inject_depth_token=True)
+        # ── Build prompt text (no <depth> token — depth fed as 2nd image) ─
+        text = preprocess_multimodal_text(
+            sample["conversations"], inject_depth_token=False
+        )
 
         # ── Tokenise text + RGB through Qwen processor ────────────────────
-        qwen_inputs = self.qwen_processor(
+        # We DO NOT pass the depth image to the processor — we process it
+        # separately so that input_ids has only one <image> placeholder.
+        # The depth tensor goes through the visual encoder in a second pass.
+        rgb_inputs = self.qwen_processor(
             text=text,
-            images=[image, depth_image],   # pass two "images": rgb + depth
+            images=rgb_image,
             return_tensors="pt",
             max_length=self.max_length,
             truncation=True,
             padding="max_length",
         )
 
-        # ── DINOv3 preprocessing for both rgb and depth ───────────────────
-        dino_rgb_inputs   = self.dino_processor(images=image,       return_tensors="pt")
-        dino_depth_inputs = self.dino_processor(images=depth_image, return_tensors="pt")
+        # Process depth through Qwen's image processor only (no text)
+        depth_inputs = self.qwen_processor.image_processor(
+            images=depth_image, return_tensors="pt"
+        )
 
         # ── Build labels (mask non-assistant tokens) ──────────────────────
-        input_ids = qwen_inputs["input_ids"].squeeze(0)
+        input_ids = rgb_inputs["input_ids"].squeeze(0)
         labels = self._build_labels(input_ids, sample["conversations"])
 
         out = {
             "input_ids":          input_ids,
-            "attention_mask":     qwen_inputs["attention_mask"].squeeze(0),
-            "pixel_values":       qwen_inputs["pixel_values"].squeeze(0),  # qwen processed (rgb+depth)
-            "dino_rgb_pixel_values":   dino_rgb_inputs["pixel_values"].squeeze(0),
-            "dino_depth_pixel_values": dino_depth_inputs["pixel_values"].squeeze(0),
-            "masks":              masks,        # [R, H, W]
-            "mask_valid":         mask_valid,   # [R]
+            "attention_mask":     rgb_inputs["attention_mask"].squeeze(0),
+            "rgb_pixel_values":   rgb_inputs["pixel_values"].squeeze(0),
+            "depth_pixel_values": depth_inputs["pixel_values"].squeeze(0),
+            "masks":              masks,
+            "mask_valid":         mask_valid,
             "labels":             labels,
         }
 
-        # Pass through Qwen-specific extras (e.g. image_grid_thw)
-        for k, v in qwen_inputs.items():
-            if k not in out and isinstance(v, torch.Tensor):
+        # Pass through Qwen extras (e.g. image_grid_thw)
+        for k, v in rgb_inputs.items():
+            if k not in ("input_ids", "attention_mask", "pixel_values") \
+                    and isinstance(v, torch.Tensor):
                 out[k] = v.squeeze(0)
 
         return out
@@ -131,14 +134,7 @@ class SpatialRGPTDataset(Dataset):
     # ──────────────────────────────────────────────────────────────────────
 
     def _build_labels(self, input_ids: torch.Tensor, conversations: list[dict]) -> torch.Tensor:
-        """
-        Mask everything that isn't an assistant ('gpt') response with -100.
-
-        Heuristic: locate the assistant text spans by re-tokenising the
-        assistant turns and matching against `input_ids`. For production,
-        replace with proper turn-aligned masking using the tokenizer's
-        chat template offsets.
-        """
+        """Mask everything except assistant ('gpt') response spans with -100."""
         labels = input_ids.clone()
         labels[:] = -100
 

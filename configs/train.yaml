@@ -16,15 +16,15 @@ stages:
   - name: "stage1_fusion_warmup"
     epochs: 1
     lr: 1.0e-4
-    trainable: ["fusion", "region_pooler", "dino_proj"]
-  - name: "stage2_dino_lora"
+    trainable: ["fusion", "region_pooler"]
+  - name: "stage2_visual_lora"
     epochs: 2
     lr: 5.0e-5
-    trainable: ["fusion", "region_pooler", "dino_proj", "dino_lora"]
+    trainable: ["fusion", "region_pooler", "qwen_visual_lora"]
   - name: "stage3_joint"
     epochs: 2
     lr: 2.0e-5
-    trainable: ["fusion", "region_pooler", "dino_proj", "dino_lora", "qwen_lora"]
+    trainable: ["fusion", "region_pooler", "qwen_visual_lora", "qwen_llm_lora"]
 
 # Optimisation
 per_device_train_batch_size: 2

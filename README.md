@@ -1,24 +1,41 @@
 # depth-VLA
 
-DINOv3 + Qwen3.5-2B vision-language model with SpatialRGPT-style region prompts and precomputed pseudo-depth.
+Qwen3.5-2B-based VLM augmented with **dual-pass visual encoding**: the same Qwen visual encoder (with LoRA) processes both the original RGB image and a precomputed pseudo-depth map, then the two token streams are conv-fused before going into the LLM.
 
 ## Architecture
 
 ```
-RGB image  ──► DINOv3 (LoRA) ──┐
-Depth PNG  ──► DINOv3 (LoRA) ──┤── 3-way Conv fusion ──┐
-RGB image  ──► Qwen visual ────┘                       │
-                                                       ▼
-                       region pooling on <mask> regions
+                           ┌─────────────────────────────┐
+                           │  OFFLINE (preprocess once)  │
+RGB image  ───► DINOv3 Depther ─► 3-channel depth PNG ───┘
+                           
+TRAIN / INFER:
+RGB image    ──► Qwen visual encoder (LoRA) ──► rgb_tokens   ┐
+Depth PNG    ──► Qwen visual encoder (LoRA, shared) ──► depth_tokens ┤
+                                                                     │
+                                                  Conv1d fusion ◄────┘
                                                        │
-                                                       ▼
-                              Qwen3.5-2B LLM (LoRA) → output
+                                                  fused_tokens
+                                                       │
+                                  region_pooler(fused, mask_i) per <mask>
+                                                       │
+                  ┌──────────────────────────────────────┐
+                  │ inputs_embeds:                       │
+                  │   <image> positions ← fused_tokens   │
+                  │   <mask>  positions ← region_tokens  │
+                  └──────────────────────────────────────┘
+                                                       │
+                                              Qwen3.5-2B LLM (LoRA)
+                                                       │
+                                                    logits
 ```
 
-- **DINOv3 ViT-Base** encodes RGB and 3-channel pseudo-depth (shared backbone, two passes)
-- **Qwen3.5-2B**'s built-in visual encoder is intercepted via forward hook
-- Three token streams fused via `Conv1d` (`token_fusion.py`)
-- For each `<mask>` token in the prompt, `RegionPooler` mask-pools fused visual features and injects them at the corresponding embedding position
+Key points:
+- **DINOv3** is used **only offline** in `preprocess_depth.py` to convert RGB → depth (`dinov3_vit7b16_dd`)
+- **Single ViT** = Qwen3.5-2B's built-in visual encoder, **shared between RGB and depth**
+- **LoRA on the visual encoder is active only during the depth pass.** The RGB pass runs under a `disable_adapter` context manager, so Qwen's pretrained RGB representation is preserved untouched. The same backbone weights are shared; only the adapter is toggled per pass.
+- **Conv1d fusion** merges the two token streams (`token_fusion.py`)
+- **Region pooling** mask-pools fused visual tokens for each `<mask>` placeholder
 
 ## Pipeline
 
@@ -27,7 +44,7 @@ RGB image  ──► Qwen visual ────┘                       │
    python scripts/download_data.py --output_root data --subset_size 100000
    ```
 
-2. **Generate pseudo-depth** — DINOv3 Depther (`dinov3_vit7b16_dd`) → 3-channel uint8 PNG
+2. **Generate pseudo-depth** — DINOv3 Depther → 3-channel uint8 PNG
    ```bash
    python scripts/preprocess_depth.py \
        --image_root data/openimages/train \
@@ -42,37 +59,43 @@ RGB image  ──► Qwen visual ────┘                       │
    python scripts/train.py --model_config configs/model.yaml --train_config configs/train.yaml
    ```
 
+## Training stages
+
+| Stage | Trainable params | Purpose |
+|-------|------------------|---------|
+| 1 | fusion + region_pooler | warm up new modules against frozen Qwen |
+| 2 | + Qwen visual LoRA | adapt visual encoder to depth modality |
+| 3 | + Qwen LLM LoRA | end-to-end joint optimisation |
+
 ## ⚠️ Known unverified assumptions
 
-These were inferred from the SpatialRGPT source / DINOv3 docs but **must be verified before training**:
+These were inferred from SpatialRGPT source / DINOv3 / Qwen docs and **must be verified before training**:
 
 ### 1. OpenSpatialDataset field names
-`src/data/utils.py::process_masks` looks for sample-level fields named `rle` / `masks` / `bboxes` / `boxes`. The actual SpatialRGPT JSON (`result_10_depth_convs.json`, ~32 GB) may use different keys (e.g. `mask_path`, `seg`, `segmentations`).
+`src/data/utils.py::process_masks` expects `rle` / `masks` / `bboxes` / `boxes` keys. Real OSD JSON may differ.
 
 **Action:** after downloading, inspect a sample:
 ```bash
 python -c "import json; d=json.load(open('data/annotations/result_10_depth_convs.json')); print(json.dumps(d[0], indent=2)[:3000])"
 ```
-Then edit `process_masks` keys accordingly.
+and patch `process_masks` keys.
 
-### 2. Qwen3.5-2B special token IDs
-`src/models/depth_vla.py::_resolve_token_ids` reads `image_token_id` / `depth_token_id` / `mask_token_id` from `qwen.config` via `getattr`. These attribute names are guesses — Qwen3.5-2B may store them differently (e.g. only `image_token_id` is exposed; `<mask>` / `<depth>` may need to be added to the tokenizer manually).
+### 2. Qwen3.5-2B special token IDs (`<image>`, `<mask>`)
+`DepthVLA._resolve_token_ids` reads `image_token_id` / `mask_token_id` from `qwen.config` via `getattr`. Qwen3.5-2B exposes `<image>` natively, but `<mask>` is **not** a built-in special token and must be added.
 
 **Action:** after loading the model:
 ```python
 print(model.qwen.config)
-print(qwen_processor.tokenizer.convert_tokens_to_ids(["<image>", "<depth>", "<mask>"]))
+print(qwen_processor.tokenizer.convert_tokens_to_ids(["<image>", "<mask>"]))
 ```
-If `<mask>` / `<depth>` aren't recognised tokens, add them via `tokenizer.add_special_tokens(...)` and resize the embedding layer (`model.qwen.resize_token_embeddings(len(tokenizer))`).
-
-### 3. Hidden dim alignment
-`configs/model.yaml` sets `dino.output_dim = 2048` to match Qwen3.5-2B's hidden size. The Qwen3.5-2B HF card lists hidden_size = 2048, but verify with:
+If `<mask>` returns the unk id, register it:
 ```python
-print(model.qwen.config.hidden_size)
+qwen_processor.tokenizer.add_special_tokens({"additional_special_tokens": ["<mask>"]})
+model.qwen.resize_token_embeddings(len(qwen_processor.tokenizer))
+model._mask_token_id = qwen_processor.tokenizer.convert_tokens_to_ids("<mask>")
 ```
-If different, update `dino.output_dim` (and `fusion.dim` automatically follows).
 
-### 4. Qwen visual encoder attribute name
+### 3. Qwen visual encoder attribute name
 `DepthVLA._find_visual_encoder` searches for child modules named `visual` / `vision_model` / `vision_encoder` / `img_encoder`. Qwen3.5-2B may use a different name.
 
 **Action:** after loading:
@@ -80,31 +103,52 @@ If different, update `dino.output_dim` (and `fusion.dim` automatically follows).
 for name, _ in model.qwen.named_children():
     print(name)
 ```
-Patch `_find_visual_encoder` if none of the candidates match.
+and patch `_find_visual_encoder` if none of the candidates match.
 
-### 5. DINOv3 Depther hardware
-`dinov3_vit7b16_dd` is a 7 B parameter model — depth pre-generation needs ≥80 GB GPU. Alternatives:
-- Use a smaller DINOv3 ConvNext depth variant once Meta releases one
-- Fall back to DepthAnythingV2 (the original SpatialRGPT choice) — replace the model loading in `scripts/preprocess_depth.py::load_dinov3_depther`
+### 4. Visual encoder LoRA target module names
+`configs/model.yaml::visual_lora.target_modules` defaults to `["q_proj", "v_proj", "qkv"]`. The actual layer names inside Qwen's visual encoder need verification. The model `__init__` will raise if 0 LoRA layers were injected.
 
-### 6. Label masking
-`SpatialRGPTDataset._build_labels` uses a substring search to locate assistant token spans. This is fragile when assistant text appears verbatim earlier in the prompt. For production, replace with proper turn-aligned masking using `tokenizer.apply_chat_template(..., return_assistant_tokens_mask=True)`.
+**Action:** after loading:
+```python
+ve = model._find_visual_encoder()
+for name, mod in ve.named_modules():
+    if isinstance(mod, torch.nn.Linear):
+        print(name)
+```
+and update `target_modules` to match.
+
+> **Note on LoRA gradient flow:** the visual LoRA adapter only sees gradients from the **depth pass** (RGB runs under `_visual_lora_disabled()`). Effective batch size for the LoRA params equals the regular batch size — not double — even though the visual encoder is invoked twice per step.
+
+### 5. Visual encoder forward signature
+`DepthVLA._encode_visual` calls `visual_encoder(pixel_values, **extras)` where `extras` may include `grid_thw`. Different Qwen VL variants accept different kwargs (e.g. `image_grid_thw`, `pixel_values_videos`, etc.).
+
+**Action:** check `inspect.signature(model._find_visual_encoder().forward)` and adjust `_encode_visual` accordingly.
+
+### 6. Spatial layout from N tokens
+`DepthVLA.forward` infers patch grid as `(√N, √N)`. If Qwen pads or uses non-square layouts, replace with `image_grid_thw`-derived dimensions.
+
+### 7. DINOv3 Depther hardware
+`dinov3_vit7b16_dd` is 7 B params — depth pre-generation needs ≥80 GB GPU. Alternatives:
+- Smaller DINOv3 ConvNext depth variants when released
+- Fall back to DepthAnythingV2 — replace `load_dinov3_depther` in `scripts/preprocess_depth.py`
+
+### 8. Label masking heuristic
+`SpatialRGPTDataset._build_labels` uses substring search to find assistant token spans. Fragile if assistant text appears verbatim earlier. For production, use `tokenizer.apply_chat_template(..., return_assistant_tokens_mask=True)`.
 
 ## Project layout
 
 ```
 depth-VLA/
 ├── configs/
-│   ├── model.yaml          # DINOv3 / Qwen / LoRA config
+│   ├── model.yaml          # Qwen + visual_lora + llm_lora config
 │   └── train.yaml          # data paths, staged training schedule
 ├── src/
 │   ├── models/
-│   │   ├── dino_encoder.py     # DINOv3 + LoRA
-│   │   ├── token_fusion.py     # Conv1d 3-way fusion
+│   │   ├── token_fusion.py     # Conv1d 2-stream fusion
 │   │   ├── region_pooler.py    # mask-guided RoI pooling
-│   │   └── depth_vla.py        # full model
+│   │   └── depth_vla.py        # full model (Qwen + dual visual pass + fusion + region)
 │   ├── data/
-│   │   ├── dataset.py          # SpatialRGPTDataset (OSD format)
+│   │   ├── dataset.py          # SpatialRGPTDataset
 │   │   ├── collator.py
 │   │   └── utils.py            # process_depth / process_masks / RLE
 │   ├── training/trainer.py     # 3-stage StagedTrainer
@@ -116,13 +160,3 @@ depth-VLA/
 │   └── infer.py
 └── requirements.txt
 ```
-
-## Training stages
-
-| Stage | Trainable params | Purpose |
-|-------|------------------|---------|
-| 1 | fusion + region_pooler + DINO proj | warm up the new modules against frozen backbones |
-| 2 | + DINOv3 LoRA | let DINO adapt to spatial reasoning data |
-| 3 | + Qwen LoRA | end-to-end joint optimisation |
-
-Configured in `configs/train.yaml::stages`.
