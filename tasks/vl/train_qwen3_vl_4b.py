@@ -93,6 +93,10 @@ def main() -> None:
             input_size=args.depth_image_size,
         ),
     )
+    total_params, trainable_params = model.trainable_parameter_summary()
+    print(f"total parameters: {total_params:,}")
+    print(f"trainable parameters: {trainable_params:,}")
+    print(f"trainable ratio: {trainable_params / total_params:.6%}")
 
     dataset = Qwen3VL4BTrainDataset(
         args.train_path,

@@ -108,10 +108,20 @@ class DepthAwareQwen3VL4B(nn.Module):
             },
             llm_hidden_size=self.model.config.hidden_size,
         ).to(dtype=self.model.dtype)
+        self._freeze_base_model()
 
     @property
     def device(self) -> torch.device:
         return next(self.parameters()).device
+
+    def _freeze_base_model(self) -> None:
+        for parameter in self.model.parameters():
+            parameter.requires_grad = False
+
+    def trainable_parameter_summary(self) -> tuple[int, int]:
+        total = sum(parameter.numel() for parameter in self.parameters())
+        trainable = sum(parameter.numel() for parameter in self.parameters() if parameter.requires_grad)
+        return total, trainable
 
     def _image_token_id(self) -> int:
         for attr in ("image_token_id", "vision_token_id"):
@@ -194,7 +204,7 @@ class DepthAwareQwen3VL4B(nn.Module):
 
         text_loss = outputs.loss
         depth_loss = self._compute_depth_loss(outputs.hidden_states[-1], input_ids, depth_images)
-        loss = text_loss + self.depth_loss_weight * depth_loss
+        loss = self.depth_loss_weight * depth_loss
 
         outputs.loss = loss
         outputs.text_loss = text_loss.detach()

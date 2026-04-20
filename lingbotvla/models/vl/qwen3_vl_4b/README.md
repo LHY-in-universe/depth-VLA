@@ -6,7 +6,8 @@ This directory contains a text-generation fine-tuning scaffold built on top of `
 
 - Image + prompt input
 - Text response supervision
-- Standard causal LM loss for text output
+- Frozen `Qwen3-VL-4B` backbone
+- Depth-only optimization on top of image tokens
 - Auxiliary depth alignment loss using frozen `MoGe + LingBot-Depth`
 - No VLA action head
 
